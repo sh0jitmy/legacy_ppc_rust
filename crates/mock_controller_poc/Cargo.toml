@@ -1,0 +1,11 @@
+[package]
+name = "mock_controller_poc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+
+[build-dependencies]
+cc = "1.0"

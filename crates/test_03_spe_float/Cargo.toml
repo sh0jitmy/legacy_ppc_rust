@@ -1,0 +1,6 @@
+[package]
+name = "test_03_spe_float"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

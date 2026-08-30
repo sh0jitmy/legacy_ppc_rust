@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/test_01_hello",
+    "crates/test_02_heap_alloc",
+    "crates/test_03_spe_float",
+    "crates/test_04_threads_sync",
+    "crates/test_05_timer_latency",
+    "crates/test_06_networking",
+    "crates/test_07_ffi",
+    "crates/test_08_https_rest",
+    "crates/mock_controller_poc",
+    "benches/rust_benchmark",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
+codegen-units = 1
