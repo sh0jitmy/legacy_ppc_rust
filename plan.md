@@ -1,0 +1,1084 @@
+# P1022 / e500v2 / Linux 2.6 向け現代Rust環境 PoC Plan
+
+## 1. 目的
+
+既存の組み込みハードウェアを変更できない前提で、以下の環境向けに現代的なRust開発環境を成立させられるか検証する。
+
+- CPU: QorIQ P1022
+- CPU core: PowerPC e500v2
+- Architecture: PowerPC 32bit
+- OS: 組み込みLinux
+- Kernel: Linux 2.6系
+- 開発: ホストPCからのクロスコンパイル
+- ターゲット上にRust compilerは不要
+
+今回、特定のベンダーやtoolchain（Wind River等）には依存しない。
+
+最終的には、
+
+- Rust + Cargoで開発できる
+- ホストからP1022向けにcross compileできる
+- 可能な限りRust `std`を利用できる
+- 既存C/C++資産をFFIで利用できる
+- 数10ms程度の処理を安定して実行できる
+- C++よりDeveloper Experienceを改善できる
+- C++に近い性能・レイテンシ特性を得られる
+
+ことを目指す。
+
+---
+
+# 2. 重要な前提
+
+現行Rustには、
+
+```text
+powerpc-unknown-linux-gnuspe
+```
+
+というLinux/PPC32/SPE向けtargetが存在する。
+
+Rust公式ドキュメントでは、このtargetはe500等のSPEを実装する32-bit PowerPC Linux向けとされている。また`std`対応のTier 3 targetとして定義されている。citeturn0search0turn0search7
+
+Rustのtarget specificationにも、
+
+```text
+llvm_target: powerpc-unknown-linux-gnuspe
+pointer_width: 32
+arch: powerpc
+std: true
+max_atomic_width: 32
+```
+
+が確認できる。citeturn0search9
+
+したがって、最初からRust compilerやLLVM backendを作るのではなく、
+
+```text
+現行Rust
+  ↓
+powerpc-unknown-linux-gnuspe
+  ↓
+LLVM PPC32/SPE
+  ↓
+P1022/e500v2
+```
+
+をまず成立させる。
+
+---
+
+# 3. 検証環境
+
+## 3.1 基本方針
+
+実機がなくても検証できるように、まずQEMU環境を構築する。
+
+QEMUには`ppce500` machineがあり、e500v2をエミュレーションできる。32-bit PowerPC CPUとしてe500v2/e500mcがサポートされている。citeturn0search1
+
+したがって、今回のPoCではQEMUを第一候補とする。
+
+```text
+Host Linux/macOS
+       |
+       +-- Rust
+       +-- Cargo
+       +-- LLVM
+       +-- cross compiler
+       |
+       v
+   PPC32/SPE ELF
+       |
+       v
+ QEMU ppce500
+       |
+       v
+ e500v2
+       |
+       v
+ Linux
+```
+
+Dockerは、
+
+- build環境の再現
+- cross compiler
+- Rust toolchain
+- sysroot
+- QEMU
+
+を固定する用途に使用する。
+
+---
+
+# 4. QEMUとDockerの役割
+
+## QEMU
+
+CPU / Linux / userspace実行環境を再現する。
+
+目的:
+
+- PPC32 binary実行
+- e500v2 instruction検証
+- libc検証
+- thread検証
+- atomic検証
+- socket検証
+- timer検証
+- latency測定
+
+## Docker
+
+build environmentを固定する。
+
+例:
+
+```text
+Docker
+ ├── Rust
+ ├── Cargo
+ ├── LLVM
+ ├── PPC cross compiler
+ ├── libc/sysroot
+ └── QEMU
+```
+
+理想的には、
+
+```bash
+docker build ...
+docker run ...
+```
+
+だけでPoC環境を再現できるようにする。
+
+---
+
+# 5. Linux 2.6をQEMUで再現する
+
+## 第一段階
+
+まずQEMU上でe500v2 + Linux 2.6系を起動できる環境を作る。
+
+重要なのは「実際の製品kernelと完全一致させる」ことではない。
+
+最初は、
+
+```text
+PPC32
++
+e500v2
++
+Linux 2.6
++
+POSIX userspace
+```
+
+を再現する。
+
+## 第二段階
+
+実機のkernel config / DTB / rootfs情報が入手できたらQEMU環境へ近づける。
+
+最終的には、
+
+```text
+QEMU kernel
+QEMU rootfs
+QEMU DTB
+```
+
+を実機環境に近づける。
+
+---
+
+# 6. QEMU machine
+
+QEMUの`ppce500` machineを利用する。
+
+基本概念:
+
+```bash
+qemu-system-ppc \
+    -M ppce500 \
+    -cpu e500v2 \
+    ...
+```
+
+QEMUの現行ドキュメントでは`ppce500`がe500 series coreをサポートし、e500v2を32-bit PowerPC CPUとしてエミュレーションできる。citeturn0search1
+
+ただし、QEMUの`ppce500`はP1022 SoCそのものを完全再現するものではない。
+
+したがって、
+
+```text
+CPU/ISA/ABI validation
+```
+
+には有効だが、
+
+```text
+P1022 peripheral/device validation
+```
+
+にはそのまま使えない。
+
+---
+
+# 7. Phase 0: ターゲット環境の調査
+
+まず実機または既存rootfsから以下を取得する。
+
+```bash
+uname -a
+uname -m
+cat /proc/cpuinfo
+```
+
+可能なら:
+
+```bash
+gcc --version
+gcc -dumpmachine
+ld --version
+ldd --version
+```
+
+さらに:
+
+```bash
+file /bin/sh
+readelf -h /bin/sh
+readelf -A /bin/sh
+```
+
+確認項目:
+
+- CPU
+- e500v2
+- endian
+- ABI
+- SPE
+- libc
+- libc version
+- target triple
+- dynamic loader
+- kernel version
+- available POSIX API
+
+この情報をQEMU userspaceの選択に利用する。
+
+---
+
+# 8. Phase 1: QEMU/Linux 2.6環境構築
+
+まずRustを一切使わず、
+
+```text
+QEMU
+ ↓
+e500v2
+ ↓
+Linux 2.6
+ ↓
+rootfs
+ ↓
+shell
+```
+
+を成立させる。
+
+最低限:
+
+```bash
+uname -a
+uname -m
+cat /proc/cpuinfo
+```
+
+が確認できる状態にする。
+
+さらに、
+
+```bash
+./hello-c
+```
+
+程度のPPC32 C binaryを実行する。
+
+---
+
+# 9. Phase 2: Rust target確認
+
+ホスト側で:
+
+```bash
+rustc --version
+cargo --version
+rustc -vV
+rustc --print target-list | grep powerpc
+```
+
+確認:
+
+```text
+powerpc-unknown-linux-gnu
+powerpc-unknown-linux-gnuspe
+```
+
+第一候補:
+
+```text
+powerpc-unknown-linux-gnuspe
+```
+
+第二候補:
+
+```text
+powerpc-unknown-linux-gnu
+```
+
+---
+
+# 10. Phase 3: RustによるPPC32/SPE code generation
+
+最小コード:
+
+```rust
+fn main() {
+    println!("Hello P1022");
+}
+```
+
+まず:
+
+```bash
+cargo build --target powerpc-unknown-linux-gnuspe
+```
+
+を試す。
+
+この段階ではlinkerがないことによる失敗は許容する。
+
+確認したいのは、
+
+```text
+rustc
+ ↓
+LLVM
+ ↓
+PPC32/SPE
+```
+
+が成立すること。
+
+---
+
+# 11. Phase 4: cross linker / sysroot
+
+QEMU guestのlibcに対応したcross compiler/sysrootを用意する。
+
+重要なのは、
+
+```text
+Rust target
+ABI
+libc
+linker
+sysroot
+dynamic loader
+```
+
+を一致させること。
+
+Cargo設定例:
+
+```toml
+[target.powerpc-unknown-linux-gnuspe]
+linker = "/opt/powerpc/bin/powerpc-linux-gcc"
+```
+
+必要に応じて、
+
+```text
+CC
+CXX
+AR
+RANLIB
+SYSROOT
+```
+
+も設定する。
+
+---
+
+# 12. Phase 5: ELF validation
+
+生成binary:
+
+```bash
+file hello
+readelf -h hello
+readelf -A hello
+```
+
+確認:
+
+```text
+ELF32
+big endian
+PowerPC
+SPE/ABI attributes
+```
+
+さらに:
+
+```bash
+readelf -l hello
+```
+
+でdynamic loaderを確認する。
+
+---
+
+# 13. Phase 6: QEMUでRust Hello World
+
+生成したbinaryをQEMU guestへコピー。
+
+```bash
+./hello
+echo $?
+```
+
+期待:
+
+```text
+Hello P1022
+0
+```
+
+失敗時は:
+
+```bash
+dmesg
+file hello
+readelf -h hello
+readelf -A hello
+```
+
+を取得する。
+
+---
+
+# 14. エラー分類
+
+## SIGILL
+
+以下を確認:
+
+- e500v2 instruction compatibility
+- SPE ABI
+- LLVM CPU feature
+- compiler flags
+- floating point / SPE
+- illegal instruction generated by LLVM
+
+## SIGSEGV
+
+以下を確認:
+
+- stack
+- TLS
+- libc
+- allocator
+- ABI
+- alignment
+- runtime
+
+## dynamic loader error
+
+以下を確認:
+
+- libc
+- sysroot
+- interpreter
+- ELF ABI
+- loader path
+
+---
+
+# 15. Phase 7: Rust `std`検証
+
+Hello Worldが動いたら、`std`を機能単位で検証する。
+
+## 15.1 Heap
+
+```rust
+fn main() {
+    let mut v = Vec::new();
+
+    for i in 0..1000 {
+        v.push(i);
+    }
+
+    println!("{}", v.len());
+}
+```
+
+確認:
+
+- malloc
+- free
+- allocator
+- Vec
+- String
+- heap
+
+---
+
+# 16. Phase 8: Thread
+
+```rust
+use std::thread;
+
+fn main() {
+    let handle = thread::spawn(|| {
+        println!("worker");
+    });
+
+    handle.join().unwrap();
+}
+```
+
+確認:
+
+- pthread
+- TLS
+- thread creation
+- stack
+- join
+
+---
+
+# 17. Phase 9: Mutex / Atomic
+
+```rust
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main() {
+    let value = Arc::new(Mutex::new(0));
+    let mut handles = Vec::new();
+
+    for _ in 0..4 {
+        let value = Arc::clone(&value);
+
+        handles.push(thread::spawn(move || {
+            let mut v = value.lock().unwrap();
+            *v += 1;
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    println!("{}", *value.lock().unwrap());
+}
+```
+
+特に確認:
+
+- AtomicU32
+- mutex
+- memory ordering
+- memory barrier
+- futex
+- thread synchronization
+
+Rustの現行`gnuspe` targetは最大atomic width 32bitとして定義されているため、AtomicU32を最初の基準とする。citeturn0search9
+
+---
+
+# 18. Phase 10: Timer
+
+```rust
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn main() {
+    let start = Instant::now();
+
+    thread::sleep(Duration::from_millis(10));
+
+    println!("{:?}", start.elapsed());
+}
+```
+
+確認:
+
+- monotonic clock
+- clock_gettime
+- nanosleep
+- timer resolution
+- scheduler latency
+
+---
+
+# 19. Phase 11: Networking
+
+順番:
+
+```text
+TcpStream
+TcpListener
+UdpSocket
+```
+
+確認:
+
+- socket
+- connect
+- accept
+- send
+- receive
+- timeout
+- non-blocking
+- poll/select
+- epoll
+
+Linux 2.6でRust `std`が必要とするAPIとの互換性を確認する。
+
+---
+
+# 20. Phase 12: C/C++ FFI
+
+既存C APIをRustから呼ぶ。
+
+C:
+
+```c
+int legacy_process(const void *data, unsigned int len);
+```
+
+Rust:
+
+```rust
+unsafe extern "C" {
+    fn legacy_process(data: *const u8, len: u32) -> i32;
+}
+```
+
+確認:
+
+- calling convention
+- integer width
+- struct layout
+- alignment
+- pointer
+- callback
+- static library
+- shared library
+
+---
+
+# 21. Phase 13: 実アプリ相当PoC
+
+最終的には以下の構造を作る。
+
+```text
+Rust application
+ ├── protocol
+ ├── state machine
+ ├── worker thread
+ ├── queue/channel
+ ├── timer
+ ├── network
+ └── FFI
+       ├── C driver
+       └── C library
+```
+
+Hello WorldだけでGo/No-Goを判断しない。
+
+実際の組み込みアプリケーションに近い処理をRustで実装する。
+
+---
+
+# 22. Phase 14: Performance
+
+C++版とRust版で同じ処理を実装する。
+
+測定:
+
+- startup
+- single operation latency
+- average
+- P95
+- P99
+- max
+- CPU usage
+- memory usage
+- allocation
+- binary size
+
+今回の要求が数10ms程度なので、
+
+```text
+average
+P95
+P99
+max
+```
+
+を重視する。
+
+QEMU上の絶対値は実機性能を保証しないため、QEMUでは主に、
+
+- 正常性
+- instruction compatibility
+- latency特性
+- regression
+
+を確認する。
+
+最終性能判定はP1022実機で行う。
+
+---
+
+# 23. Phase 15: Developer Experience
+
+性能だけではなく、C++から移行する価値を確認する。
+
+評価項目:
+
+```text
+Cargo
+dependency management
+build
+test
+fmt
+clippy
+error handling
+memory safety
+FFI
+cross compilation
+debugging
+```
+
+最終的に、
+
+```bash
+cargo build
+cargo test
+cargo fmt
+cargo clippy
+```
+
+が開発者の日常ワークフローになることを目標とする。
+
+---
+
+# 24. CI
+
+Dockerでbuild環境を固定する。
+
+例:
+
+```text
+Docker image
+ ├── Rust
+ ├── Cargo
+ ├── LLVM
+ ├── PPC cross compiler
+ ├── target sysroot
+ └── QEMU
+```
+
+CI:
+
+```bash
+cargo fmt --check
+cargo clippy
+cargo test
+cargo build --release --target powerpc-unknown-linux-gnuspe
+```
+
+さらにQEMU integration test:
+
+```text
+cargo build
+   ↓
+PPC32 ELF
+   ↓
+QEMU
+   ↓
+Linux 2.6
+   ↓
+execute
+   ↓
+test result
+```
+
+まで自動化する。
+
+---
+
+# 25. QEMU integration test
+
+最終的にはCIから、
+
+```bash
+./run-qemu.sh
+```
+
+だけで、
+
+```text
+1. QEMU起動
+2. Linux boot
+3. rootfs mount
+4. Rust binary配置
+5. Rust binary実行
+6. test result取得
+7. QEMU shutdown
+```
+
+を実行できるようにする。
+
+理想的にはDocker内からQEMUまで実行し、開発環境を完全再現する。
+
+---
+
+# 26. Fallback A: custom target
+
+`powerpc-unknown-linux-gnuspe`をそのまま利用できない場合。
+
+```text
+Rust
+ ↓
+custom target specification
+ ↓
+LLVM PPC32/SPE
+ ↓
+Linux 2.6
+```
+
+を検討する。
+
+LLVM backend自体は変更しないことを優先する。
+
+---
+
+# 27. Fallback B: `std`を利用できない
+
+全面的な`no_std`化は最後の手段とする。
+
+まず、
+
+```text
+Rust
+ ↓
+no_std
+ ↓
+alloc
+ ↓
+thin compatibility layer
+ ↓
+C/POSIX
+ ↓
+Linux 2.6
+```
+
+を検討する。
+
+Rust applicationの大部分を現代的なRustで記述し、kernel/libc固有部分だけをcompatibility layerへ閉じ込める。
+
+---
+
+# 28. Fallback C: SPE ABI問題
+
+SPE ABIが現行Rust/LLVMと一致しない場合、LLVM backendを変更する前に以下を確認する。
+
+- target feature
+- compiler flags
+- ABI
+- libc ABI
+- linker
+- compiler-rt
+- libgcc
+- atomic implementation
+- calling convention
+- stack alignment
+
+---
+
+# 29. Fallback D: musl
+
+glibc系sysrootとの組み合わせが難しい場合、musl + SPEも調査対象とする。
+
+ただし現行Rustの`powerpc-unknown-linux-muslspe`は`std`をサポートせず、別途`core`等のbuildが必要になるため、第一候補にはしない。citeturn0search3
+
+---
+
+# 30. Go / TinyGoとの比較
+
+Rust PoCが成立した後、必要ならTinyGoも比較する。
+
+比較軸:
+
+| 項目 | Rust | TinyGo |
+|---|---|---|
+| PPC32/SPE | 要検証 | 要検証 |
+| LLVM利用 | Yes | Yes |
+| GC | No | 構成依存 |
+| C FFI | 強い | 強い |
+| C++に近い性能 | ◎ | ○〜◎ |
+| `std`相当 | ◎ | △ |
+| embedded向け | ◎ | ◎ |
+| Linux 2.6 | 要検証 | 要検証 |
+| Developer Experience | ◎ | ◎ |
+
+今回の第一候補はRustとする。
+
+---
+
+# 31. Go/No-Go判定
+
+## Green
+
+以下まで成立:
+
+```text
+Rust stable/nightly
+    ↓
+powerpc-unknown-linux-gnuspe
+    ↓
+PPC32/SPE ELF
+    ↓
+QEMU e500v2
+    ↓
+Linux 2.6
+    ↓
+std
+    ↓
+thread
+    ↓
+sync/atomic
+    ↓
+socket
+    ↓
+C FFI
+```
+
+この場合、P1022実機へ移行して本格PoCを実施する。
+
+## Yellow
+
+```text
+Rust
+ ↓
+PPC32/SPE
+ ↓
+Linux 2.6
+ ↓
+no_std/alloc
+```
+
+までは成立するが`std`が難しい。
+
+この場合、compatibility layer方式を検討する。
+
+## Red
+
+以下が成立しない:
+
+```text
+LLVM
+ ↓
+PPC32/SPE
+ ↓
+e500v2
+```
+
+この場合、Rust導入より先にLLVM/backend/ABI問題を解決する必要がある。
+
+---
+
+# 32. 最終目標アーキテクチャ
+
+```text
+                       Developer
+                           |
+                           | Rust / Cargo
+                           v
+                 +---------------------+
+                 | Modern Rust         |
+                 | Application         |
+                 |                     |
+                 | Cargo               |
+                 | rustfmt             |
+                 | clippy              |
+                 +----------+----------+
+                            |
+                            | Cross Compile
+                            v
+                 +---------------------+
+                 | rustc + LLVM        |
+                 |                     |
+                 | PPC32 / SPE         |
+                 +----------+----------+
+                            |
+                            | ELF32
+                            v
+                 +---------------------+
+                 | Target libc/sysroot |
+                 | Linker              |
+                 +----------+----------+
+                            |
+                            v
+                 +---------------------+
+                 | QEMU ppce500        |
+                 | e500v2              |
+                 +----------+----------+
+                            |
+                            v
+                 +---------------------+
+                 | Linux 2.6           |
+                 +----------+----------+
+                            |
+                            v
+                 +---------------------+
+                 | QorIQ P1022         |
+                 | e500v2              |
+                 +---------------------+
+```
+
+---
+
+# 33. 最初のGo/No-Goポイント
+
+最初に確認すべきなのは、
+
+> **QEMUのe500v2上でLinux 2.6を起動し、`powerpc-unknown-linux-gnuspe`でビルドしたRust binaryを実行できるか**
+
+である。
+
+その次に、
+
+> **同じbinaryから`std::thread`と`AtomicU32`が利用できるか**
+
+を確認する。
+
+ここまで通れば、「P1022/Linux 2.6という古い実行環境を維持したまま、現代Rustによるアプリケーション開発へ移行する」という構想がかなり現実的になる。
+
+---
+
+# 34. 注意事項
+
+現行RustのSPE targetはTier 3であり、公式ドキュメント上もPPC32/SPE向けの既存targetではあるが、通常のTier 1/2 targetと同じレベルの保証を期待してはいけない。
+
+また、Rust公式ドキュメントではPowerPC SPE向けGCCサポートがGCC 9で削除されたと明記されている。そのため、現代的なRust compilerが存在することと、現代的なPPC SPE C toolchainだけで全てを構築できることは別問題である。cross linker/sysrootの選定はPoCの主要な検証項目とする。
+
+QEMUの`ppce500`はe500v2 CPUをエミュレートできるが、P1022 SoCそのものを完全再現するものではない。CPU/ISA/ABI/Linux/userspaceの検証には使える一方、P1022固有の周辺デバイスやdriverの検証には実機または専用QEMUモデルが必要になる。
